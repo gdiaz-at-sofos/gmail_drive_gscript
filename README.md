@@ -4,7 +4,7 @@
 ## Como ejecutar el proyecto
 
 ### Configuración
-- Crear un nuevo proyecto en [Google Apps Script](script.google.com).
+- Crear un nuevo proyecto en [Google Apps Script](https://script.google.com).
 - En la ventana de `Editor`, pulsar `New Script File` y crear los archivos `main.gs`, `pluralize.gs`, `spelling.gs`.
 - Copiar el contenido de los archivos `main.gs`, `pluralize.gs` y `spelling.gs` desde el repositorio a los archivos recién creados.
 - En la ventana de `Project Settings`, activar `Show "appsscript.json" manifest file in editor`.
