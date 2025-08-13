@@ -1,48 +1,139 @@
-const GMAIL_FILTERS = "in:inbox has:attachment";
-const DRIVE_FOLDER = "Files";
+const GMAIL_FILTERS = "in:inbox";
+const DRIVE_FOLDER = "GMAIL_SCRIPT";
+const CONFIG_FOLDER = "CONFIG";
+const FILES_FOLDER = "FILES";
+const CONFIG_FILE_NAME = "config.json"
+
+// Mapped variables for replies
+function getReplyVars({ missingDocuments = [] } = {}) {
+  let missingDocsMessage = "";
+  for (const [docNames, docTypes] of missingDocuments) {
+    const nameMessage = docNames.length <= 1 ? docNames.join('') : `${docNames.slice(0, -1).join(', ')} o ${docNames.slice(-1)}`;
+    const typeMessage = docTypes.length <= 1 ? docTypes.join('') : `${docTypes.slice(0, -1).join(', ')} o ${docTypes.slice(-1)}`;
+    missingDocsMessage += (`${nameMessage} (en formato ${typeMessage}).<br>`)
+  }
+  return {
+    MISSING_DOCS: missingDocsMessage
+  }
+}
+
+// Default configuration settings
+const DEFAULT_CONFIG = {
+  query: {
+    fromDate: "29/07/2025",
+    toDate: "",
+  },
+  types: {
+    pasantia: {
+      searchKeywords: ["pasantía", "pasante"],
+      documents: [
+        [["CURRICULUM_VITAE", "CV"], ["pdf", "doc", "docx"]],
+        [["FACTURA_1"], ["jpg", "jpeg", "png"]],
+        [["FACTURA_2"], ["jpg", "jpeg", "png"]]
+      ]
+    },
+    exoneracion: {
+      searchKeywords: ["exoneración", "exonerar"],
+      documents: [
+        [["REPORTE", "INFORME"], ["pdf", "xls", "xlsx"]],
+        [["NOTAS"], ["pdf", "doc", "docx"]]
+      ]
+    },
+    incripcion: {
+      searchKeywords: ["inscripción", "inscribir"],
+      documents: [
+        [["OPSU"], ["pdf", "doc", "docx"]],
+        [["NOTAS"], ["pdf", "doc", "docx"]]
+      ]
+    }
+  },
+  replyMessages: {
+    error: `<p>No ha sido posible procesar su correo electrónico. Los siguientes documentos requeridos no fueron adjuntados:</p>
+<p><strong>$MISSING_DOCS</strong></p>
+<p>Este es un mensaje generado automáticamente. Por favor, no responder a este correo.</p>`,
+    success: `<p>Hemos recibido y procesado su mensaje con éxito.</p>
+<p>En breve, un coordinador se pondrá en contacto con usted.</p>
+<p>Este es un mensaje generado automáticamente. Por favor, no responder a este correo.</p>`
+  }
+};
 
 function main() {
-  // Get keywords from Script Properties
-  const keywords = PropertiesService.getScriptProperties().getProperty('SEARCH_KEYWORDS');
+  // Get configuration from Drive folder
+  const { query, types, replyMessages } = findOrCreateConfigFile();
+  const { error: errorMessage, success: successMessage } = replyMessages;
+  const { fromDate, toDate } = query;
 
-  if (!keywords || keywords.trim() === "") {
-    Logger.log("Error: 'SEARCH_KEYWORDS' property is not set or is empty. Please configure it in Project Settings > Script properties");
+  if (!types) {
+    Logger.log(`Error: 'types' property is not set or is empty. Please set it in ${DRIVE_FOLDER}/${CONFIG_FOLDER}/${CONFIG_FILE_NAME}`);
     return;
   }
 
-  // Expand the keywords to include accents (TODO) and plural forms
-  const expandedKeywords = expandQueryKeywords(keywords);
-
   // Add API filters for the search query
-  const query = expandedKeywords.join(" OR ") + " " + GMAIL_FILTERS;
+  const fromDateFilter = fromDate ? `after:${fromDate}` : "";
+  const toDateFilter = toDate ? `after:${toDate}` : "";
 
-  Logger.log(`Searching Gmail with query: '${query}'`);
+  for (const [type, { searchKeywords, documents: expectedDocuments }] of Object.entries(types)) {
+    // Expand the keywords to include accents and plural forms
+    const expandedKeywords = expandQueryKeywords(searchKeywords);
 
-  try {
-    // GmailApp.search returns GmailThread objects.
-    const threads = GmailApp.search(query);
+    const query = `${expandedKeywords.join(" OR ")} ${GMAIL_FILTERS} ${fromDateFilter} ${toDateFilter}`
 
-    if (!threads.length) {
-      Logger.log("No threads found with matching emails and attachments");
-      return;
-    }
+    Logger.log(`Searching Gmail with query: '${query}'`);
+    try {
+      // GmailApp.search returns GmailThread objects.
+      const threads = GmailApp.search(query);
 
-    Logger.log(`Found ${threads.length} threads matching the query`);
+      if (!threads.length) {
+        Logger.log("No threads found for given query");
+        return;
+      }
 
-    // Iterate through each thread and then each message within the thread
-    for (const thread of threads) {
-      const messages = thread.getMessages();
+      Logger.log(`Found ${threads.length} threads matching the query`);
 
-      for (const message of messages) {
+      // Iterate through each thread and then each message within the thread
+      for (const thread of threads) {
+        const messages = thread.getMessages();
+
+        // If is  more than one message in the thread, skip it
+        // We assume it's a conversation or an already handled thread
+        if (messages.length > 1) continue;
+
+        // Handle the first and only message in the thread
+        const message = messages[0];
+
+        // Get attachments for that message
         const attachments = message.getAttachments();
+        const attachmentNames = attachments.map(attachment => attachment.getName());
 
-        if (!attachments.length) continue;
+        // Search for the current expected documents
+        const missingDocuments = [];
+        for (const [docNames, docTypes] of expectedDocuments) {
+          // Check if any of the possible document names with any of the possible extensions exist
+          const found = docNames.some(docName => {
+            const regex = new RegExp(`^${docName}\\.(${docTypes.join('|')})$`, 'i');
+            return attachmentNames.some(attachmentName => regex.test(attachmentName));
+          });
 
+          if (!found) {
+            missingDocuments.push([docNames, docTypes]);
+          }
+        }
+
+        // If there are missing documents, reply to the sender with the error
+        if (missingDocuments.length > 0) {
+          replyToThread(thread, errorMessage, { missingDocuments });
+          continue;
+        }
+
+        // If all documents are present, reply to the sender with success confirmation
+        replyToThread(thread, successMessage, {});
+
+        // Save documents to Google Drive
         const { senderName, senderEmail } = getSenderDetails(message);
         const subject = message.getSubject();
         const { timestamp, month, year } = getTimeDetails(message);
 
-        const driveFolderPath = `${DRIVE_FOLDER}/${year}/${month}`;
+        const driveFolderPath = `${DRIVE_FOLDER}/${FILES_FOLDER}/${year}/${month.toUpperCase()}/${type.toUpperCase()}`
 
         let parentFolderId = null
         for (const folderName of driveFolderPath.split("/")) {
@@ -51,7 +142,7 @@ function main() {
 
         for (const attachment of attachments) {
           const attachmentName = `(${senderName}) (${timestamp}) (${attachment.getName()})`
-          const attachmentDescription = `Email from ${senderName}_${senderEmail} with subject '${subject}'`
+          const attachmentDescription = `Email from ${senderName}_${senderEmail} with subject '${subject}' for type of email '${type}'`
 
           const attachmentDetails = {
             name: attachmentName,
@@ -62,11 +153,53 @@ function main() {
 
           saveToDrive(attachmentDetails, parentFolderId);
         }
+
       }
+    } catch (err) {
+      Logger.log(`Error occurred during Gmail search: ${err.message}`);
     }
-  } catch (err) {
-    Logger.log(`Error occurred during Gmail search: ${err.message}`);
   }
+}
+
+// Helper function to form a message with the given variables and reply to a thread
+function replyToThread(thread, message, inlineVars) {
+  const replyVars = getReplyVars(inlineVars);
+  const replyMessage = message.replace(/\$([A-Z_]+)/g, (match, p1) => {
+    return replyVars[p1] || match;
+  });
+  thread.reply(replyMessage, { htmlBody: replyMessage });
+}
+
+// Retrieve configuration from Google Drive
+function findOrCreateConfigFile() {
+  Logger.log("Checking for Drive configuration file...");
+  // Initialize with default config
+  let config = DEFAULT_CONFIG;
+
+  // Get or create the root Drive folder
+  const rootFolderId = findOrCreateFolder(DRIVE_FOLDER);
+
+  // Get or create the configuration folder inside the root folder
+  const configFolderId = findOrCreateFolder(CONFIG_FOLDER, rootFolderId);
+
+  // Search for the configuration file within the config folder
+  const configFolder = DriveApp.getFolderById(configFolderId);
+  const files = configFolder.getFilesByName(CONFIG_FILE_NAME);
+
+  // If the file exists, retrieve its content. If not, create it with default settings
+  if (files.hasNext()) {
+    const configFile = files.next();
+    const fileContent = configFile.getBlob().getDataAsString();
+    config = JSON.parse(fileContent);
+    Logger.log(`Configuration file '${CONFIG_FILE_NAME}' found and loaded.`);
+  } else {
+    // configFolder.createFile(CONFIG_FILE_NAME, JSON.stringify(DEFAULT_CONFIG, null, 2), MimeType.JSON);
+    const configBlob = Utilities.newBlob(JSON.stringify(DEFAULT_CONFIG, null, 2), MimeType.JSON, CONFIG_FILE_NAME);
+    configFolder.createFile(configBlob);
+    Logger.log(`Configuration file '${CONFIG_FILE_NAME}' not found. Created with default settings.`);
+  }
+
+  return config;
 }
 
 // Helper function to get time details from date field in a Gmail's message
@@ -184,15 +317,17 @@ function expandQueryKeywords(keywords) {
     return [];
   }
 
-  for (const keyword of keywords.split(" ")) {
+  for (const keyword of keywords) {
     // Skip empty strings from multiple spaces
     if (!keyword.trim()) continue;
 
     // Transform to lower case
     lowerCaseKeyword = keyword.toLowerCase()
 
-    // Add the original keyword
-    expandedKeywords.add(lowerCaseKeyword);
+    // Add the original keyword and normalized version (without accents)
+    expandedKeywords
+      .add(lowerCaseKeyword)
+      .add(lowerCaseKeyword.normalize("NFD").replace(/[\u0300-\u036f]/g, ""));
 
     // Add plural form if it exists and is different from the original
     const pluralFormOriginal = pluralize(lowerCaseKeyword);
